@@ -1,210 +1,130 @@
 <?php
-/*
-  -------------------------------------------
-  ___  ____ ____ ____ ___ ____ _  _ ____ ___  
-  |__] |__/ |___ [__   |  |__| |\/| |__| |__] 
-  |    |  \ |___ ___]  |  |  | |  | |  | |  
+/**
+ * Prestamap — générateur autonome de sitemap pour PrestaShop.
+ * Sébastien VIDOTTO — Heteractis — Licence MIT.
+ * Les routes historiques et id_lang = 1 sont conservés : voir README.md.
+ */
 
-  -------------------------------------------
-  
-  PrestaMap - Votre Générateur de Sitemap Automatique pour PrestaShop
-  Auteur : Sébastien VIDOTTO
-  Version : 1.0
-  Date : 28 Spetembre 2023
-  Licence : MIT
-  
-  Description :
-  -------------
-  PrestaMap est un script PHP qui génère automatiquement un fichier sitemap.xml pour votre site PrestaShop.
-  Il prend en charge les règles de réécriture d'URL personnalisées et s'occupe également de la configuration du fichier .htaccess.
-  
-  Avantages :
-  -----------
-  1. Gestion automatique du fichier .htaccess.
-  2. Connexion automatique à votre base de données PrestaShop.
-  3. Pas besoin de tâches cron.
-  4. Votre sitemap est toujours à jour.
-  
-  Routes :
-  --------
-  * Route vers les produits : {id}{-:id_product_attribute}-{rewrite}.html
-  * Route vers la catégorie : boutique-{id}-{rewrite}
-  * Route vers les fournisseurs : fournisseurs-{id}__{rewrite}
-  * Route vers les marques : marques-{id}_{rewrite}
-  * Route vers les pages : {id}-{rewrite}
-  * Route vers les catégories de pages : categorie/{id}-{rewrite}
-  * Route vers les modules : module/{module}{/:controller}
-  
-*/
+// Les erreurs ne doivent jamais corrompre le XML ou exposer la configuration.
+ini_set('display_errors', '0');
+$sitemapFile = __DIR__ . '/sitemap.xml';
+$temporaryFile = null;
+$conn = null;
 
-
-error_reporting(E_ALL); ini_set("display_errors", 1); 
-
-	// Définition des variables pour la gestion du fichier .htaccess
-	
-	$htaccessFile = $_SERVER['DOCUMENT_ROOT'] . '/.htaccess'; // Chemin vers le fichier .htaccess
-	
-	
-    $rewriteRule = "RewriteRule ^sitemap\\.xml$ /sitemap.php [L]\n"; // Règle de réécriture pour rediriger sitemap.xml vers sitemap.php
-    $modRewriteCheck = "<IfModule mod_rewrite.c>"; // Vérification de la présence du module mod_rewrite
-	
-	// Vérifie si le fichier .htaccess existe
-    if (file_exists($htaccessFile)) {
-        $htaccessContent = file_get_contents($htaccessFile); // Lecture du contenu du fichier .htaccess
-		
-		 // Vérifie si la règle de réécriture n'est pas déjà présente
-        if (strpos($htaccessContent, $rewriteRule) === false) {
-            // Vérifie si la condition mod_rewrite existe déjà
-            if (strpos($htaccessContent, $modRewriteCheck) !== false) {
-                // Ajoute la règle à l'intérieur de la section mod_rewrite existante
-                $newContent = preg_replace("/(<IfModule mod_rewrite.c>)/", "$1\n    " . $rewriteRule, $htaccessContent);
-                file_put_contents($htaccessFile, $newContent);
-            } else {
-                // Ajoute une nouvelle section mod_rewrite
-                $rewriteRule = $modRewriteCheck . "\n    " . $rewriteRule . "</IfModule>\n";
-                file_put_contents($htaccessFile, $rewriteRule, FILE_APPEND);
-            }
+try {
+    // Servir le cache avant de charger la configuration ou de contacter MySQL.
+    clearstatcache(true, $sitemapFile);
+    if (is_file($sitemapFile) && time() - filemtime($sitemapFile) < 86400) {
+        $cachedXml = @file_get_contents($sitemapFile);
+        $cacheDocument = new DOMDocument();
+        $previousErrors = libxml_use_internal_errors(true);
+        try {
+            $validCache = is_string($cachedXml) && $cachedXml !== ''
+                && $cacheDocument->loadXML($cachedXml, LIBXML_NONET)
+                && $cacheDocument->doctype === null
+                && $cacheDocument->documentElement->localName === 'urlset'
+                && $cacheDocument->documentElement->namespaceURI === 'http://www.sitemaps.org/schemas/sitemap/0.9';
+        } finally {
+            libxml_clear_errors();
+            libxml_use_internal_errors($previousErrors);
         }
-    } else {
-        // Crée un nouveau fichier .htaccess avec la section mod_rewrite
-        $rewriteRule = $modRewriteCheck . "\n    " . $rewriteRule . "</IfModule>\n";
-        file_put_contents($htaccessFile, $rewriteRule);
+        if ($validCache) {
+            header('Content-Type: application/xml; charset=UTF-8');
+            echo $cachedXml;
+            return;
+        }
     }
 
+    $parametersPath = __DIR__ . '/app/config/parameters.php';
+    if (!is_readable($parametersPath)) {
+        throw new RuntimeException('PrestaShop configuration unavailable');
+    }
+    $configuration = include $parametersPath;
+    if (!is_array($configuration) || !isset($configuration['parameters'])) {
+        throw new RuntimeException('Invalid PrestaShop configuration');
+    }
+    $parameters = $configuration['parameters'];
+    foreach (array('database_host', 'database_user', 'database_password', 'database_name', 'database_prefix') as $key) {
+        if (!isset($parameters[$key]) || !is_string($parameters[$key])) {
+            throw new RuntimeException('Missing database configuration');
+        }
+    }
+    $prefix = $parameters['database_prefix'];
+    if (!preg_match('/^[a-zA-Z0-9_]+$/D', $prefix)) {
+        throw new RuntimeException('Invalid database prefix');
+    }
+    $host = isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : '';
+    if (!is_string($host) || !preg_match('/^[a-zA-Z0-9.-]+(?::[0-9]{1,5})?$/D', $host)) {
+        throw new RuntimeException('A valid HTTP host is required');
+    }
+    // Comportement historique : HTTPS, boutique à la racine du domaine.
+    $serverURL = 'https://' . $host;
+    $port = !empty($parameters['database_port']) ? (int) $parameters['database_port'] : 3306;
+    $conn = new mysqli($parameters['database_host'], $parameters['database_user'], $parameters['database_password'], $parameters['database_name'], $port);
+    if ($conn->connect_error || !$conn->set_charset('utf8mb4')) {
+        throw new RuntimeException('Database connection unavailable');
+    }
 
+    $dom = new DOMDocument('1.0', 'UTF-8');
+    $urlset = $dom->createElement('urlset');
+    $urlset->setAttribute('xmlns', 'http://www.sitemaps.org/schemas/sitemap/0.9');
+    $dom->appendChild($urlset);
 
-
-
-
-// Construction du chemin vers le fichier parameters.php
-$parametersPath = $_SERVER['DOCUMENT_ROOT'] . '/app/config/parameters.php';
-
-// Inclusion des paramètres de PrestaShop
-$parameters = include($parametersPath);
-
-// Connexion à la base de données PrestaShop
-$servername = $parameters['parameters']['database_host'];
-$username = $parameters['parameters']['database_user'];
-$password = $parameters['parameters']['database_password'];
-$dbname = $parameters['parameters']['database_name'];
-$port = $parameters['parameters']['database_port'];
-
-$conn = new mysqli($servername, $username, $password, $dbname, $port);
-
-if ($conn->connect_error) {
-    die("Connection failed: " . $conn->connect_error);
-}
-
-// Détection de l'URL du serveur
-$serverURL = 'https://' . $_SERVER['HTTP_HOST'];
-
-// Si le fichier sitemap.xml existe déjà, retournez-le
-if (file_exists('sitemap.xml')) {
-    $sitemap = simplexml_load_file('sitemap.xml');
-    header('Content-Type: text/xml');
-    echo $sitemap->asXML();
-	 $fileTime = filemtime('sitemap.xml');
-    $currentTime = time();
-    if (($currentTime - $fileTime) < 86400) { // 86400 secondes dans une journée
-        $regenerateSitemap = false;
+    // Requêtes et formats historiques : aucune nouvelle promesse de compatibilité.
+    $sources = array(
+        array(
+            'sql' => "SELECT cl.id_category, cl.link_rewrite FROM {$prefix}category_lang AS cl JOIN {$prefix}category AS c ON cl.id_category = c.id_category WHERE cl.id_lang = 1 AND c.id_parent != 0",
+            'id' => 'id_category', 'prefix' => '/boutique-', 'suffix' => ''
+        ),
+        array(
+            'sql' => "SELECT id_product, link_rewrite FROM {$prefix}product_lang WHERE id_lang = 1",
+            'id' => 'id_product', 'prefix' => '/', 'suffix' => '.html'
+        ),
+        array(
+            'sql' => "SELECT id_cms, link_rewrite FROM {$prefix}cms_lang WHERE id_lang = 1",
+            'id' => 'id_cms', 'prefix' => '/', 'suffix' => ''
+        )
+    );
+    foreach ($sources as $source) {
+        $result = $conn->query($source['sql']);
+        if ($result === false) {
+            throw new RuntimeException('Sitemap query failed');
+        }
+        while ($row = $result->fetch_assoc()) {
+            $url = $dom->createElement('url');
+            $loc = $dom->createElement('loc');
+            $loc->appendChild($dom->createTextNode($serverURL . $source['prefix'] . $row[$source['id']] . '-' . $row['link_rewrite'] . $source['suffix']));
+            $url->appendChild($loc);
+            $urlset->appendChild($url);
+        }
+    }
+    $xml = $dom->saveXML();
+    if ($xml === false) {
+        throw new RuntimeException('XML generation failed');
+    }
+    // Ne remplacer l'ancien sitemap qu'une fois le nouveau entièrement écrit.
+    $temporaryFile = @tempnam(__DIR__, '.prestamap-');
+    if ($temporaryFile === false || dirname($temporaryFile) !== __DIR__
+        || @file_put_contents($temporaryFile, $xml, LOCK_EX) !== strlen($xml)
+        || !@chmod($temporaryFile, 0644)
+        || !@rename($temporaryFile, $sitemapFile)) {
+        throw new RuntimeException('Sitemap publication failed');
+    }
+    $temporaryFile = null;
+    header('Content-Type: application/xml; charset=UTF-8');
+    echo $xml;
+} catch (Throwable $error) {
+    // Ni SQL, ni identifiants, ni trace d'exception dans la réponse publique.
+    error_log('Prestamap: sitemap generation failed; check configuration, database and directory permissions.');
+    http_response_code(503);
+    header('Content-Type: text/plain; charset=UTF-8');
+    header('Retry-After: 300');
+    echo "Sitemap temporairement indisponible.\n";
+} finally {
+    if (is_string($temporaryFile) && is_file($temporaryFile)) {
+        @unlink($temporaryFile);
+    }
+    if ($conn !== null) {
+        $conn->close();
     }
 }
-
-// if en cas de spam ( En cours de test )
-
-//if ($regenerateSitemap) {
-
-		// Création du fichier XML
-		$dom = new DOMDocument("1.0", "UTF-8");
-		$urlset = $dom->createElement("urlset");
-		$urlset->setAttribute("xmlns", "http://www.sitemaps.org/schemas/sitemap/0.9");
-		$dom->appendChild($urlset);
-
-		// Récupération des URL des catégories
-		$sql = "SELECT cl.id_category, cl.link_rewrite FROM " . $parameters['parameters']['database_prefix'] . "category_lang AS cl JOIN " . $parameters['parameters']['database_prefix'] . "category AS c ON cl.id_category = c.id_category WHERE cl.id_lang = 1 AND c.id_parent != 0";
-		$result = $conn->query($sql);
-
-		if ($result->num_rows > 0) {
-			while($row = $result->fetch_assoc()) {
-				$url = $dom->createElement("url");
-				$loc = $dom->createElement("loc", $serverURL . "/boutique-" . $row["id_category"] . "-" . $row["link_rewrite"]);
-				$url->appendChild($loc);
-				$urlset->appendChild($url);
-			}
-		}
-
-		// Récupération des URL des produits
-		$sql = "SELECT id_product, link_rewrite FROM " . $parameters['parameters']['database_prefix'] . "product_lang WHERE id_lang = 1";
-		$result = $conn->query($sql);
-
-		if ($result->num_rows > 0) {
-			while($row = $result->fetch_assoc()) {
-				$url = $dom->createElement("url");
-				$loc = $dom->createElement("loc", $serverURL . "/" . $row["id_product"] . "-" . $row["link_rewrite"] . ".html");
-				$url->appendChild($loc);
-				$urlset->appendChild($url);
-			}
-		}
-
-		// Récupération des URL des pages CMS
-		$sql = "SELECT id_cms, link_rewrite FROM " . $parameters['parameters']['database_prefix'] . "cms_lang WHERE id_lang = 1";
-		$result = $conn->query($sql);
-
-		if ($result->num_rows > 0) {
-			while($row = $result->fetch_assoc()) {
-				$url = $dom->createElement("url");
-				$loc = $dom->createElement("loc", $serverURL . "/" . $row["id_cms"] . "-" . $row["link_rewrite"]);
-				$url->appendChild($loc);
-				$urlset->appendChild($url);
-			}
-		}
-
-/*
-
-
-// Récupération des URL des fournisseurs
-$sql = "SELECT id_supplier, name FROM " . $parameters['parameters']['database_prefix'] . "supplier_lang WHERE id_lang = 1";
-$result = $conn->query($sql);
-
-if ($result->num_rows > 0) {
-    while($row = $result->fetch_assoc()) {
-        $url = $dom->createElement("url");
-        $loc = $dom->createElement("loc", $serverURL . "/fournisseurs-" . $row["id_supplier"] . "__" . $row["name"]);
-        $url->appendChild($loc);
-        $urlset->appendChild($url);
-    }
-}
-
-// Récupération des URL des marques
-$sql = "SELECT id_manufacturer, name FROM " . $parameters['parameters']['database_prefix'] . "manufacturer_lang WHERE id_lang = 1";
-$result = $conn->query($sql);
-
-if ($result->num_rows > 0) {
-    while($row = $result->fetch_assoc()) {
-        $url = $dom->createElement("url");
-        $loc = $dom->createElement("loc", $serverURL . "/marques-" . $row["id_manufacturer"] . "_" . $row["name"]);
-        $url->appendChild($loc);
-        $urlset->appendChild($url);
-    }
-}
-
-// Récupération des URL des catégories de pages
-$sql = "SELECT id_cms_category, link_rewrite FROM " . $parameters['parameters']['database_prefix'] . "cms_category_lang WHERE id_lang = 1";
-$result = $conn->query($sql);
-
-if ($result->num_rows > 0) {
-    while($row = $result->fetch_assoc()) {
-        $url = $dom->createElement("url");
-        $loc = $dom->createElement("loc", $serverURL . "/categorie/" . $row["id_cms_category"] . "-" . $row["link_rewrite"]);
-        $url->appendChild($loc);
-        $urlset->appendChild($url);
-    }
-}
-*/
-
-	// Enregistrement du nouveau fichier XML
-	$dom->save("sitemap.xml");
-//}
-$conn->close();
-?>
-
